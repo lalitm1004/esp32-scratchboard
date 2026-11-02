@@ -1,0 +1,3 @@
+# Runtime configuration values used by espflash / esp-println.
+[env]
+ESP_LOG = "info"

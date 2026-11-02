@@ -1,0 +1,15 @@
+include = ["esp-config.toml"]
+
+[target.xtensa-esp32s3-none-elf]
+# No `runner` here on purpose: building and flashing are kept separate.
+# Build with `cargo build` / `just build`, then flash with `just flash`.
+
+[build]
+rustflags = [
+  "-C", "link-arg=-nostartfiles",
+]
+
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core"]
