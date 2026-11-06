@@ -15,7 +15,7 @@ hard-won API details, memory/linker gotchas, wiring, and troubleshooting.
 
 | Crate | Version | Features | Why |
 |-------|---------|----------|-----|
-| `esp-hal` | `~1.2.2` | `esp32s3`, `log-04` | Hardware abstraction layer |
+| `esp-hal` | `~1.2.2` | `esp32s3`, `log-04`, `unstable` | Hardware abstraction layer (`unstable` needed for I2S) |
 | `esp-rtos` | `0.4.0` | `embassy`, `esp32s3`, `log-04` | Embassy executor + timers for esp-hal 1.x |
 | `esp-bootloader-esp-idf` | `0.6.0` | `esp32s3`, `log-04` | `esp_app_desc!()` + IDF bootloader glue |
 | `esp-println` | `0.18.0` | `esp32s3`, `log-04` | `log` backend over UART/USB-JTAG |
@@ -28,7 +28,8 @@ hard-won API details, memory/linker gotchas, wiring, and troubleshooting.
 | `mipidsi` | `0.10.0` | *(default)* | MIPI DCS display driver (ILI9341) |
 | `embedded-graphics-core` | `0.4.1` | — | `Rgb565` type |
 | `embedded-hal-bus` | `0.3.0` | — | `ExclusiveDevice` (SpiBus → SpiDevice) |
-| `libm` | `0.2.11` | — | `sinf`/`cosf` in `no_std` |
+| `libm` | `0.2.11` | — | `sinf`/`cosf`/`log10f` in `no_std` |
+| `microfft` | `0.6.0` | `default-features = false`, `size-512` | no_std FFT (spectrum visualizer) |
 
 Release profile (`Cargo.toml`): `codegen-units = 1`, `lto = "fat"`, `opt-level = "s"`, `debug = 2`.
 
@@ -427,6 +428,142 @@ SPI-bound (~25–30 fps at 40 MHz), so these set absolute spin rate. Past
 These are the ESP32-S3 **FSPI (SPI2) default pins** for SCK/MOSI/CS, with
 DC/RST/BL on free GPIOs. Change them via the `PIN_*` consts in `src/main.rs`.
 
+### Audio (MAX98357A over I2S0)
+
+| MAX98357A pin | ESP32-S3 GPIO | Notes |
+|---------------|---------------|-------|
+| BCLK          | **4**  | I2S bit clock |
+| LRC / WS      | **5**  | word select (left/right clock) |
+| DIN           | **6**  | I2S data out → amp input |
+| VIN           | 3.3V or 5V | 5 V = louder (2.5–5.5 V range) |
+| GND           | GND   | common ground with the ESP32 |
+| SD            | float / VIN | active-low shutdown; floating enables (pull-up) |
+| GAIN          | float | optional gain select |
+| Speaker ±     | speaker | |
+
+No MCLK needed — the MAX98357A generates its internal clock from BCLK. Three
+signal pins total; GPIOs 4/5/6 don't clash with the display pins.
+
+---
+
+## 8b. I2S audio playback (esp-hal)
+
+### Setup (TX, Philips/I2S standard)
+
+```rust
+use esp_hal::i2s::master::{I2s, DataFormat, Channels, TdmConfig};
+use esp_hal::time::Rate;
+
+let i2s = I2s::new(
+    peripherals.I2S0,
+    peripherals.DMA_CH0,               // GDMA channel on ESP32-S3
+    TdmConfig::new_tdm_philips()
+        .with_sample_rate(Rate::from_hz(22050))
+        .with_data_format(DataFormat::Data16Channel16) // 16-bit samples
+        .with_channels(Channels::MONO),                // mono
+).unwrap();
+
+let mut i2s_tx = i2s.i2s_tx
+    .with_bclk(gpio(PIN_I2S_BCLK))
+    .with_ws(gpio(PIN_I2S_WS))
+    .with_dout(gpio(PIN_I2S_DIN))
+    .build();
+```
+
+- I2S (like SPI) needs the **`unstable` feature** on `esp-hal`.
+- `i2s.i2s_tx` is a `TxCreator`; `.with_bclk/.with_ws/.with_dout` take pins,
+  `.build()` returns `I2sTx`.
+- `Channels::MONO` still emits the standard 2-slot (L/R) frame, but only the L
+  slot carries data — the MAX98357A plays it.
+
+### Streaming with DMA
+
+```rust
+use esp_hal::dma_tx_buffer;
+
+let mut dma_buf = dma_tx_buffer!(2048).unwrap();   // DmaTxBuf
+
+// ... fill dma_buf, then:
+let transfer = i2s_tx.write(dma_buf).unwrap();     // consumes i2s_tx + buf
+// ... do other work while DMA transmits ...
+let (_, tx, buf) = transfer.wait();                // returns i2s_tx + buf
+i2s_tx = tx; dma_buf = buf;
+```
+
+- `I2sTx::write(buf: DmaTxBuf)` consumes both and returns `I2sTxDmaTransfer`;
+  `.wait()` blocks until the DMA is done and hands both back.
+- `DmaTxBuf::fill(&[u8])` copies + sets the transmitted length, or use
+  `as_mut_slice()` (full capacity) + `set_length(n)`.
+- This single-buffer pattern is gap-free as long as the FFT/draw work fits
+  inside one chunk's duration (46 ms for 2048 bytes @ 22.05 kHz).
+
+### WAV embedding
+
+- Re-encode to small PCM first (16-bit mono is ideal):
+  `ffmpeg -i in.wav -ac 1 -ar 22050 -sample_fmt s16 out.wav`
+- `const WAV: &[u8] = include_bytes!("../out.wav");` — lands in `.rodata`
+  (flash-mapped), read directly (no RAM copy).
+- Parse the `fmt `/`data` chunks at runtime to get sample rate + PCM offset, so
+  the I2S config follows the file automatically.
+
+### FFT visualizer (microfft)
+
+```rust
+use microfft::real::rfft_512;   // input [f32; 512] -> [Complex32; 256]
+
+let mut buf = [0f32; 512];
+// fill buf with windowed samples (i16 -> f32 / 32768, Hann window)
+let bins = rfft_512(&mut buf);  // in-place, aliases buf as complex
+let mag = bins[k].norm_sqr();   // re^2 + im^2
+```
+
+- `f32::powf` is **not** available in `no_std` — use `libm::powf`/`expf`/`logf`.
+- Log-space the FFT bins into bars (bass gets narrow bins, treble gets grouped)
+  for a natural look.
+
+---
+
+## 8c. Analog input (ADC) — joystick
+
+The ADC (like I2S) needs the **`unstable`** feature. ESP32-S3 has ADC1
+(GPIO1–10) and ADC2 (GPIO11–20); prefer ADC1.
+
+```rust
+use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
+use nb::block; // add `nb = "1.1"` to Cargo.toml
+
+let mut cfg = AdcConfig::new();
+let mut vrx = cfg.enable_pin(peripherals.GPIO4, Attenuation::_11dB); // AdcPin
+let mut vry = cfg.enable_pin(peripherals.GPIO5, Attenuation::_11dB);
+let mut adc = Adc::new(peripherals.ADC1, cfg);
+
+let x: u16 = block!(adc.read_oneshot(&mut vrx)).unwrap(); // 0..4095
+```
+
+Key points:
+
+- `AdcConfig::enable_pin(pin, attenuation)` returns an `AdcPin<PIN, ADC>`. The
+  pin must be a **typed** `GpioPin<N>` (an ADC1 channel) — `AnyPin` does **not**
+  implement `AdcChannel`, so you can't use `AnyPin::steal` for ADC pins.
+- `read_oneshot` returns `nb::Result<u16, ()>` (non-blocking; the first call
+  starts a conversion and returns `WouldBlock`). Poll with `nb::block!(...)`.
+- `Attenuation::_11dB` gives ~0–3.1 V range; the other attenuations are for
+  smaller full-scale voltages. Use 11 dB for a 0–3.3 V signal.
+- The result is 12-bit (0–4095).
+
+### Wiring a PS2 analog joystick module
+
+| Joystick pin | ESP32-S3 | Notes |
+|--------------|----------|-------|
+| VCC          | 3.3V     | **not 5 V** — ADC input is 3.3 V max |
+| GND          | GND      | |
+| VRx          | GPIO4    | ADC1_CH3 (X axis) |
+| VRy          | GPIO5    | ADC1_CH4 (Y axis) |
+| SW           | GPIO6    | active-low button → `Input::new(..., Pull::Up)`, read `is_low()` |
+
+Auto-center the stick at boot (read once, assume released), then map
+`(raw - center)` to a screen offset. A small deadzone removes jitter.
+
 ---
 
 ## 9. Build & flash (justfile)
@@ -465,6 +602,9 @@ just erase     # espflash erase-flash
 | `cargo`/`rustc` not found in `nix develop` | Not in FHS env — it's interactive-only; use the `script` pty trick (§2) |
 | "Xtensa linker not found" | espup export file not sourced — be inside `nix develop` |
 | No serial output | Check port (`--port`); `ESP_LOG` level in `.cargo/esp-config.toml` |
+| No sound from speaker | Check BCLK/WS/DIN wiring; `SD` must not be held low (active-low shutdown) |
+| Garbled/crackly audio | WAV must be 16-bit PCM mono; `Channels::MONO` + `DataFormat::Data16Channel16`; confirm sample rate matches the WAV header |
+| `no method named powf found for f32` | `f32::powf` needs `std` — use `libm::powf`/`expf`/`logf` |
 
 ---
 
